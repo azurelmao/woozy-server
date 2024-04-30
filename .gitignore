@@ -1,0 +1,9 @@
+/docs/
+/lib/
+/bin/
+/.shards/
+/.idea/
+*.iml
+*.dwarf
+shard.lock
+/server
