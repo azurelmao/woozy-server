@@ -10,7 +10,7 @@ targets:
 
 dependencies:
   woozy:
-    path: "../woozy"
+    github: "azurelmao/woozy"
     version: 0.1.0
 
 crystal: '>= 1.11.2'
