@@ -25,7 +25,11 @@ struct Woozy::Server
     end
   end
 
-  def key_loop(channel : Channel(Char | Key))
+  alias Command = String
+
+  def key_loop(channel : Channel(Command))
+    self.set_terminal_mode
+
     loop do
       char = STDIN.read_char
 
@@ -47,30 +51,55 @@ struct Woozy::Server
           when nil
             exit
           when 'A'
-            channel.send Key::Up
+            self.handle_key(channel, Key::Up)
           when 'B'
-            channel.send Key::Down
+            self.handle_key(channel, Key::Down)
           when 'C'
-            channel.send Key::Right
+            self.handle_key(channel, Key::Right)
           when 'D'
-            channel.send Key::Left
+            self.handle_key(channel, Key::Left)
           when '3'
             case char4 = STDIN.read_char
             when nil
               exit
             when '~'
-              channel.send Key::Delete
+              self.handle_key(channel, Key::Delete)
             end
           end
         end
       when '\n'
-        channel.send Key::Enter
+        self.handle_key(channel, Key::Enter)
       when '\u{7f}'
-        channel.send Key::Backspace
+        self.handle_key(channel, Key::Backspace)
       else
-        channel.send char
+        self.handle_key(channel, char)
       end
     end
+  end
+
+  def handle_key(channel : Channel(Command), key : Char | Key)
+    print "\e[2K\r"
+
+    case key
+    when Char
+      @command_history.write_at_cursor(key)
+    when .enter?
+      channel.send @command_history.send
+    when .backspace?
+      @command_history.delete_prev_char
+    when .delete?
+      @command_history.delete_current_char
+    when .up?
+      @command_history.move_to_prev_record
+    when .down?
+      @command_history.move_to_next_record
+    when .right?
+      @command_history.move_cursor_right
+    when .left?
+      @command_history.move_cursor_left
+    end
+
+    print "> #{@command_history.current_record.join}\r\e[#{2 + @command_history.cursor_index}C"
   end
 
   def handle_command(command : String)
