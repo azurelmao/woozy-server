@@ -16,13 +16,13 @@ struct Woozy::Server
     @world.set_chunk Chunk.new at: ChunkPos.new(0, 0, 0)
   end
 
-  def start
+  def start : Nil
     command_channel = Channel(Command).new
-    spawn key_loop(command_channel)
+    spawn self.key_loop(command_channel)
     Fiber.yield
 
     packet_channel = Channel({Client, Packet}).new
-    spawn client_loop(packet_channel)
+    spawn self.client_loop(packet_channel)
     Fiber.yield
 
     Log.info { "Server started!" }
@@ -31,15 +31,15 @@ struct Woozy::Server
     loop do
       select
       when timeout(1.second)
-        print "\e[2K\r"
+        self.clear_line
 
         loop do
           select
-          when client_and_packet = packet_channel.receive?
-            next unless client_and_packet
+          when client_and_packet = packet_channel.receive
             client, packet = client_and_packet
-            handle_packet(client, packet)
+            self.handle_packet(client, packet)
           else
+            Log.trace{"test"}
             break
           end
         end
@@ -47,7 +47,7 @@ struct Woozy::Server
         loop do
           select
           when command = command_channel.receive
-            handle_command(command)
+            self.handle_command(command)
           else
             break
           end
@@ -55,22 +55,22 @@ struct Woozy::Server
 
         update
 
-        print "> #{@command_history.current_record.join}\r\e[#{2 + @command_history.cursor_index}C"
+        self.print_current_line
       end
     end
   end
 
-  def update
+  def update : Nil
     Log.info { @clients }
     @tick += 1
   end
 
-  def stop
+  def stop : Nil
     Log.info { "Server stopped!" }
 
     @clients.each_value do |client|
       client.send ServerDisconnectPacket.new "Server stopped!"
-      client.close
+      client.stop
     end
 
     exit
