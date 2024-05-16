@@ -7,7 +7,10 @@ struct Woozy::Client
   end
 
   def stop : Nil
-    @stop_channel.send true
+    select
+    when @stop_channel.send true
+    else
+    end
   end
 
   def packet_loop : Nil

@@ -8,12 +8,12 @@ struct Woozy::Server
     @tcp_server = TCPServer.new host, port
     @clients = Hash(String, Client).new
 
-    @tick = 0
-
     @command_history = Chronicle.new
 
     @world = World.new
     @world.set_chunk Chunk.new at: ChunkPos.new(0, 0, 0)
+
+    @tick = 0
   end
 
   def start : Nil
@@ -27,7 +27,7 @@ struct Woozy::Server
 
     Log.info { "Server started!" }
 
-    print "> "
+    self.clear_line
     loop do
       select
       when timeout(1.second)
@@ -39,7 +39,6 @@ struct Woozy::Server
             client, packet = client_and_packet
             self.handle_packet(client, packet)
           else
-            Log.trace{"test"}
             break
           end
         end
@@ -61,17 +60,21 @@ struct Woozy::Server
   end
 
   def update : Nil
-    Log.info { @clients }
+    Log.info { @clients.keys }
     @tick += 1
   end
 
   def stop : Nil
-    Log.info { "Server stopped!" }
+    Log.info { "Stopping server!" }
 
     @clients.each_value do |client|
+      Log.info &.emit "Disconnected client", addr: client.local_address.address, username: client.username
       client.send ServerDisconnectPacket.new "Server stopped!"
       client.stop
+
     end
+
+    Log.info { "Server stopped!" }
 
     exit
   end

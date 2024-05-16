@@ -35,21 +35,21 @@ struct Woozy::Server
 
       case char
       when nil # STDIN was closed
-        exit
+        self.stop
       when '\u{3}' # Ctrl+C
         puts "^C"
-        exit
+        self.stop
       when '\u{4}' # Ctrl+D
         puts
-        exit
+        self.stop
       when '\e'
         case char2 = STDIN.read_char
         when nil
-          exit
+          self.stop
         when '['
           case char3 = STDIN.read_char
           when nil
-            exit
+            self.stop
           when 'A'
             self.handle_key(channel, Key::Up)
           when 'B'
@@ -61,7 +61,7 @@ struct Woozy::Server
           when '3'
             case char4 = STDIN.read_char
             when nil
-              exit
+              self.stop
             when '~'
               self.handle_key(channel, Key::Delete)
             end
