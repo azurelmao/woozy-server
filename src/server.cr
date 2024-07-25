@@ -20,7 +20,7 @@ end
 
 struct Woozy::Server
   def initialize(host : String, port : Int32)
-    @server = TCPServer.new host, port
+    @server = TCPServer.new(host, port)
     @client_channel = Channel(FreshClient).new
     @fresh_clients = Array(FreshClient).new
     @clients = Array(Client).new
@@ -230,7 +230,7 @@ struct Woozy::Server
     when "stop"
       self.stop
     when "list"
-      Log.info{@clients}
+      Log.info { @clients }
     else
       Log.error { "Unknown command! - #{command}" }
     end
@@ -238,6 +238,7 @@ struct Woozy::Server
 
   def start : Nil
     self.set_terminal_mode
+    Log.info { "Server started!" }
     self.update_console_input
 
     spawn self.char_fiber
@@ -254,7 +255,7 @@ struct Woozy::Server
   end
 
   def update : Nil
-  # Check for new clients
+    # Check for new clients
     loop do
       select # Non-blocking, raising receive
       when fresh_client = @client_channel.receive
@@ -328,10 +329,10 @@ while index < ARGV.size
 end
 
 begin
-  server = Woozy::Server.new host, port
+  server = Woozy::Server.new(host, port)
   server.start
 rescue ex
-  Log.fatal(exception: ex) {""}
+  Log.fatal(exception: ex) { "" }
   if server
     server.stop
   end

@@ -1,2 +1,2 @@
 require "spec"
-require "../src/woozy"
+require "../src/server"

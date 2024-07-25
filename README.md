@@ -1,6 +1,6 @@
 # woozy-server
 
-TODO: Write a description here
+WIP voxel-game server.
 
 ## Installation
 
