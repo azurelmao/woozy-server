@@ -105,15 +105,23 @@ struct Woozy::Server
     bytes = Bytes.new(Packet::MaxSize)
 
     until client.connection.closed?
-      bytes_read, _ = client.connection.receive(bytes)
-      break if bytes_read.zero? # Connection was closed
-      packet = Packet.from_bytes(bytes[0...bytes_read].dup)
-      client.packet_channel.send(packet)
+      begin
+        bytes_read, _ = client.connection.receive(bytes)
+        break if bytes_read.zero? # Connection was closed
+        packet = Packet.from_bytes(bytes[0...bytes_read].dup)
+        spawn client.packet_channel.send(packet)
+      rescue
+        break
+      end
     end
   end
 
   def handle_packet(client : Client, packet : Packet) : Nil
-    Log.trace { packet }
+    case
+    when client_disconnect_packet = packet.client_disconnect_packet
+      @clients.delete(client)
+      Log.info &.emit "Client left", username: client.username
+    end
   end
 
   alias Chars = StaticArray(Char, 4)
@@ -223,16 +231,34 @@ struct Woozy::Server
     nil
   end
 
-  def handle_command(command : String) : Nil
-    case command
+  def handle_command(command : Array(String)) : Nil
+    case command[0]?
+    when "help"
+      Log.info { "Available commands: help, hello, stop, list, kick" }
     when "hello"
       Log.info { "world!" }
     when "stop"
       self.stop
     when "list"
-      Log.info { @clients }
+      Log.info { @clients.map(&.username) }
+    when "kick"
+      if arg = command[1]?
+        self.kick_client(arg)
+      end
     else
-      Log.error { "Unknown command! - #{command}" }
+      Log.error { "Unknown command `#{command.join(' ')}` !" }
+    end
+  end
+
+  def kick_client(username : String)
+    if client = @clients.find { |client| client.username == username }
+      cause = "Kicked by operator"
+      Log.info &.emit "Disconnected client", username: client.username, cause: cause
+      client.connection.send(ServerDisconnectPacket.new(cause))
+      # client.connection.close
+      # @clients.delete(client)
+    else
+      Log.error { "Could not find client with username `#{username}` !" }
     end
   end
 
@@ -273,6 +299,7 @@ struct Woozy::Server
         if username
           client = Client.new(fresh_client.connection, username)
           @clients << client
+          spawn self.handle_client(client)
         end
         next true
       else
@@ -297,7 +324,7 @@ struct Woozy::Server
     when chars = @char_channel.receive
       if keyboard_action = self.handle_chars(chars)
         command = self.handle_keyboard_action(keyboard_action)
-        self.handle_command(command) if command
+        self.handle_command(command.split(' ')) if command && !command.blank? && !command.empty?
       end
     else
     end
