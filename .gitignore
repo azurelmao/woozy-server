@@ -1,9 +1,9 @@
 /docs/
 /lib/
 /bin/
+/run/
 /.shards/
 /.idea/
 *.iml
 *.dwarf
 shard.lock
-/server
