@@ -1,9 +1,11 @@
+require "sqlite3"
+require "crypto/bcrypt/password"
 require "woozy"
 require "./world/world"
 
 class Woozy::FreshClient
   property connection : TCPSocket
-  property packet_channel = Channel(Packet?).new
+  property auth_channel = Channel(Client?).new
 
   def initialize(@connection)
   end
@@ -21,8 +23,12 @@ end
 class Woozy::Server
   Username = "[Server]"
 
-  @blacklist : Set(String)
-  @whitelist : Set(String)
+  enum BlacklistMode
+    Username
+    Address
+  end
+
+  record BlacklistEntry, username : String, address : String, mode : BlacklistMode, reason : String
 
   def initialize(host : String, port : Int32)
     @server = TCPServer.new(host, port)
@@ -30,46 +36,130 @@ class Woozy::Server
     @fresh_clients = Array(FreshClient).new
     @clients = Array(Client).new
 
-    unless File.exists?("blacklist.txt")
-      File.write("blacklist.txt", "")
+    unless File.exists?("openssl.cfg")
+      File.write("openssl.cfg", <<-CFG)
+        [req]
+        distinguished_name = req_distinguished_name
+        req_extensions = v3_req
+        prompt = no
+
+        [req_distinguished_name]
+        organizationName = woozy-server
+        organizationalUnitName = azurelmao
+        commonName = localhost
+
+        [ v3_req ]
+        basicConstraints = CA:FALSE
+        keyUsage = nonRepudiation, digitalSignature, keyEncipherment
+        subjectAltName = @alt_names
+
+        [alt_names]
+        DNS.1 = *.localhost
+      CFG
     end
 
-    @blacklist = File.read("blacklist.txt").split.map(&.strip).to_set
-
-    unless File.exists?("whitelist.txt")
-      File.write("whitelist.txt", "")
+    unless File.exists?("private.key")
+      `openssl genpkey -algorithm ED25519 > private.key`
     end
 
-    @whitelist = File.read("whitelist.txt").split.map(&.strip).to_set
+    unless File.exists?("public.cert")
+      `openssl req -new -key private.key -config openssl.cfg -out unsigned.csr`
+      `openssl x509 -req -days 3650 -in unsigned.csr -signkey private.key -out public.cert`
+      File.delete("unsigned.csr") if File.exists?("unsigned.csr")
+    end
+
+    @context = OpenSSL::SSL::Context::Server.new
+    @context.private_key = "private.key"
+    @context.certificate_chain = "public.cert"
+
+    unless File.exists?("blacklist.csv")
+      File.write("blacklist.csv", "")
+    end
+
+    @blacklist = Set(BlacklistEntry).new
+    File.read("blacklist.csv").each_line do |line|
+      data = line.strip.split(',')
+
+      if data.size != 4
+        Log.error { "Incorrect number of values in blacklist.csv, ignoring entry `#{line}`" }
+        next
+      end
+
+      username, address, mode, reason = data
+
+      username = username.strip
+      unless Woozy.valid_username?(username)
+        Log.error { "Invalid username in blacklist.csv, ignoring entry `#{line}`" }
+        next
+      end
+
+      address = address.strip
+      unless Socket::IPAddress.valid?(address)
+        Log.error { "Invalid address in blacklist.csv, ignoring entry `#{line}`" }
+        next
+      end
+
+      mode = mode.strip
+      case mode
+      when "username"
+        mode = BlacklistMode::Username
+      when "address"
+        mode = BlacklistMode::Address
+      else
+        Log.error { "Invalid mode in blacklist.csv, ignoring entry `#{line}`" }
+        next
+      end
+
+      reason = reason.strip
+
+      @blacklist << BlacklistEntry.new(username, address, mode, reason)
+    end
+
+    unless File.exists?("whitelist.csv")
+      File.write("whitelist.csv", "")
+    end
+
+    @whitelist = Set(String).new
+    File.read("whitelist.csv").each_line do |line|
+      username = line.strip
+
+      unless Woozy.valid_username?(username)
+        Log.error { "Invalid username in whitelist.csv, ignoring entry `#{line}`" }
+        next
+      end
+
+      @whitelist << username
+    end
 
     @config = Hash(String, Bool | Float64 | Int32).new
     @config["whitelist"] = false
 
-    unless File.exists?("config.txt")
+    unless File.exists?("server.cfg")
       config = String.build do |string|
         @config.each do |(key, value)|
           string << key
           string << '='
           string << value
+          string << '\n'
         end
       end
-      File.write("config.txt", config)
+      File.write("server.cfg", config)
     end
 
-    File.read("config.txt").split.map(&.strip).each do |pair|
-      key, value = pair.split('=')
+    File.read("server.cfg").each_line do |line|
+      key, value = line.strip.split('=')
       key = key.strip
       value = value.strip
 
       if @config.has_key?(key)
-        parsed_value = Server.parse_config_value(value)
+        parsed_value = Woozy.parse_config_value(value)
         if !parsed_value.nil? && parsed_value.class == @config[key].class
           @config[key] = parsed_value
         else
-          Log.error { "Invalid value `#{value}` for config key `#{key}` in config.txt" }
+          Log.error { "Invalid value `#{value}` for config key `#{key}` in server.cfg" }
         end
       else
-        Log.error { "Unknown config key `#{key}` in config.txt" }
+        Log.error { "Unknown config key `#{key}` in server.cfg" }
       end
     end
 
@@ -83,17 +173,6 @@ class Woozy::Server
     @tick = 0
   end
 
-  def self.parse_config_value(value : String)
-    case value
-    when "true" then true
-    when "false" then false
-    when .to_i? then value.to_i
-    when .to_f? then value.to_f
-    else
-      nil
-    end
-  end
-
   def client_fiber : Nil
     while new_connection = @server.accept?
       client = FreshClient.new(new_connection)
@@ -101,83 +180,133 @@ class Woozy::Server
     end
   end
 
-  def fresh_client_fiber(fresh_client : FreshClient) : Nil
+  def handle_fresh_client(fresh_client : FreshClient) : Nil
     bytes = Bytes.new(Packet::MaxSize)
 
-    if fresh_client.connection.closed?
-      fresh_client.packet_channel.send(nil)
+    remote_address = if fresh_client.connection.closed?
+      fresh_client.auth_channel.send(nil)
+      return
+    else
+      fresh_client.connection.remote_address.to_s
+    end
+
+    bytes_read = 0
+    begin
+      OpenSSL::SSL::Socket::Server.open(fresh_client.connection, @context) do |ssl_connection|
+        bytes_read = ssl_connection.read(bytes)
+      end
+    rescue ex : OpenSSL::SSL::Error
+      cause = "Client does not trust unverified CA"
+      Log.info &.emit "Disconnected client", address: remote_address, cause: cause
+      fresh_client.connection.send(ServerDisconnectPacket.new(cause))
+      fresh_client.connection.close
+      fresh_client.auth_channel.send(nil)
       return
     end
 
-    bytes_read, _ = fresh_client.connection.receive(bytes)
     if bytes_read.zero? # Connection was closed
-      fresh_client.packet_channel.send(nil)
+      cause = "Client left"
+      Log.info &.emit "Disconnected client", address: remote_address, cause: cause
+      fresh_client.auth_channel.send(nil)
       return
     end
 
     packet = Packet.from_bytes(bytes[0...bytes_read].dup)
-    fresh_client.packet_channel.send(packet)
-  end
 
-  def handle_fresh_client(fresh_client : FreshClient, packet : Packet?) : Nil
     unless packet
-      Log.info &.emit "Client left", address: fresh_client.connection.remote_address.to_s
+      cause = "Invalid handshake"
+      Log.info &.emit "Disconnected client", address: remote_address, cause: cause
+      fresh_client.connection.send(ServerDisconnectPacket.new(cause))
+      fresh_client.connection.close
+      fresh_client.auth_channel.send(nil)
       return
     end
 
     unless client_handshake_packet = packet.client_handshake_packet
       cause = "Invalid handshake"
-      Log.info &.emit "Disconnected client", address: fresh_client.connection.remote_address.to_s, cause: cause
+      Log.info &.emit "Disconnected client", address: remote_address, cause: cause
       fresh_client.connection.send(ServerDisconnectPacket.new(cause))
       fresh_client.connection.close
+      fresh_client.auth_channel.send(nil)
       return
     end
 
     unless username = client_handshake_packet.username
       cause = "Username is nil"
-      Log.info &.emit "Disconnected client", address: fresh_client.connection.remote_address.to_s, cause: cause
+      Log.info &.emit "Disconnected client", address: remote_address, cause: cause
       fresh_client.connection.send(ServerDisconnectPacket.new(cause))
       fresh_client.connection.close
+      fresh_client.auth_channel.send(nil)
       return
     end
 
-    unless username.ascii_only?
+    unless password = client_handshake_packet.password
+      cause = "Password is nil"
+      Log.info &.emit "Disconnected client", address: remote_address, cause: cause
+      fresh_client.connection.send(ServerDisconnectPacket.new(cause))
+      fresh_client.connection.close
+      fresh_client.auth_channel.send(nil)
+      return
+    end
+
+    unless Woozy.valid_username?(username)
       cause = "Username is not valid"
-      Log.info &.emit "Disconnected client", address: fresh_client.connection.remote_address.to_s, cause: cause
+      Log.info &.emit "Disconnected client", address: remote_address, cause: cause
       fresh_client.connection.send(ServerDisconnectPacket.new(cause))
       fresh_client.connection.close
+      fresh_client.auth_channel.send(nil)
       return
     end
 
-    if @blacklist.includes?(username)
+    if self.blacklisted?(username) || self.ip_blacklisted?(fresh_client.connection.remote_address.address)
       cause = "Client is blacklisted"
-      Log.info &.emit "Disconnected client", address: fresh_client.connection.remote_address.to_s, username: username, cause: cause
+      Log.info &.emit "Disconnected client", address: remote_address, username: username, cause: cause
       fresh_client.connection.send(ServerDisconnectPacket.new(cause))
       fresh_client.connection.close
+      fresh_client.auth_channel.send(nil)
       return
     end
 
     if @config["whitelist"] && !@whitelist.includes?(username)
       cause = "Client is not whitelisted"
-      Log.info &.emit "Disconnected client", address: fresh_client.connection.remote_address.to_s, username: username, cause: cause
+      Log.info &.emit "Disconnected client", address: remote_address, username: username, cause: cause
       fresh_client.connection.send(ServerDisconnectPacket.new(cause))
       fresh_client.connection.close
+      fresh_client.auth_channel.send(nil)
       return
+    end
+
+    DB.open("sqlite3://./server.db") do |db|
+      db.exec("CREATE TABLE IF NOT EXISTS accounts (username varchar(32), password String)")
+      db_username = db.query_one?("SELECT username FROM accounts WHERE username = ?", username, as: String)
+
+      if db_username # Username exists, therefore client is logging in
+        db_hashed_password = db.query_one("SELECT password FROM accounts WHERE username = ? LIMIT 1", username, as: String)
+
+        unless Crypto::Bcrypt::Password.new(db_hashed_password).verify(password)
+          cause = "Password is incorrect"
+          Log.info &.emit "Disconnected client", address: remote_address, username: username, cause: cause
+          fresh_client.connection.send(ServerDisconnectPacket.new(cause))
+          fresh_client.connection.close
+          fresh_client.auth_channel.send(nil)
+          return
+        end
+      else # Username does not exist, therefore client is signing up
+        hashed_password = Crypto::Bcrypt::Password.create(password, cost: 14)
+        db.exec("INSERT INTO accounts (username, password) VALUES (?, ?)", username, hashed_password.to_s)
+      end
     end
 
     if self.client_by_username(username)
       cause = "Client is already on the server"
-      Log.info &.emit "Disconnected client", address: fresh_client.connection.remote_address.to_s, username: username, cause: cause
+      Log.info &.emit "Disconnected client", address: remote_address, username: username, cause: cause
       fresh_client.connection.send(ServerDisconnectPacket.new(cause))
       fresh_client.connection.close
+      fresh_client.auth_channel.send(nil)
       return
     end
 
-    Log.info &.emit "Client joined", address: fresh_client.connection.remote_address.to_s, username: username
-    fresh_client.connection.send(ServerHandshakePacket.new)
-    client = Client.new(fresh_client.connection, username)
-    @clients << client
-    spawn self.handle_client(client)
+    fresh_client.auth_channel.send(Client.new(fresh_client.connection, username))
   end
 
   def handle_client(client : Client) : Nil
@@ -340,23 +469,56 @@ class Woozy::Server
     when "list"
       self.list_clients
     when "kick"
-      unless username = command[1]?
+      unless (username = command[1]?) && Woozy.valid_username?(username)
         Log.error &.emit "Command syntax:", u1: "kick <username>"
         return
       end
 
       self.kick_client(username)
     when "ban"
-      unless username = command[1]?
-        Log.error &.emit "Command syntax:", u1: "ban <username>"
+      unless (username = command[1]?) && Woozy.valid_username?(username)
+        Log.error &.emit "Command syntax:", u1: "ban <username> (reason)"
         return
       end
 
-      self.ban_client(username)
+      reason = if command[2]?
+        command[2..].join(' ')
+      else
+        ""
+      end
+
+      self.ban_client(username, reason)
+    when "unban"
+      unless (username = command[1]?) && Woozy.valid_username?(username)
+        Log.error &.emit "Command syntax:", u1: "unban <username>"
+        return
+      end
+
+      self.unban_client(username)
+    when "ban-ip"
+      unless (username = command[1]?) && Woozy.valid_username?(username)
+        Log.error &.emit "Command syntax:", u1: "ban-ip <username> (reason)"
+        return
+      end
+
+      reason = if command[2]?
+        command[2..].join(' ')
+      else
+        ""
+      end
+
+      self.ban_ip(username, reason)
+    when "unban-ip"
+      unless (username = command[1]?) && Woozy.valid_username?(username)
+        Log.error &.emit "Command syntax:", u1: "unban-ip <username>"
+        return
+      end
+
+      self.unban_ip(username)
     when "whitelist"
       case command[1]?
       when "add"
-        unless username = command[2]?
+        unless (username = command[2]?) && Woozy.valid_username?(username)
           Log.error &.emit "Command syntax:", u1: "whitelist add <username>"
           return
         end
@@ -364,7 +526,7 @@ class Woozy::Server
         Log.info { "Added `#{username}` to the whitelist" }
         @whitelist << username
       when "remove"
-        unless username = command[2]?
+        unless (username = command[2]?) && Woozy.valid_username?(username)
           Log.error &.emit "Command syntax:", u1: "whitelist remove <username>"
           return
         end
@@ -381,7 +543,7 @@ class Woozy::Server
         Log.error &.emit "Command syntax:", u1: "whitelist add/remove <username>", u2: "whitelist enable/disable"
       end
     when "msg"
-      unless username = command[1]?
+      unless (username = command[1]?) && Woozy.valid_username?(username)
         Log.error &.emit "Command syntax:", u1: "msg <username> <message>"
         return
       end
@@ -413,16 +575,34 @@ class Woozy::Server
   end
 
   def list_commands : Nil
-    Log.info { "Available commands: hello, help, stop, msg, say, list, kick" }
+    {% begin %}
+    commands = String.build do |string|
+    {% for method in Server.methods %}
+    {% if method.name.symbolize == :handle_command %}
+    {% commands = method.body.whens.map(&.conds.first) %}
+    {% for command, index in commands %}
+      string << {{command}}
+
+      {% if index != commands.size - 1 %}
+        string << ','
+        string << ' '
+      {% end %}
+    {% end %}
+    {% end %}
+    {% end %}
+    end
+    {% end %}
+
+    Log.info { "Available commands: #{commands}" }
   end
 
   def list_clients : Nil
     Log.info { @clients.map(&.username) }
   end
 
-  def kick_client(username : String) : Nil
+  def kick_client(username : String, reason = "") : Nil
     self.client_by_username(username) do |client|
-      cause = "Kicked by operator"
+      cause = "Kicked by operator for: #{reason}"
       Log.info &.emit "Disconnected client", username: client.username, cause: cause
       client.connection.send(ServerDisconnectPacket.new(cause))
       client.connection.close
@@ -430,15 +610,54 @@ class Woozy::Server
     end
   end
 
-  def ban_client(username : String) : Nil
+  def blacklisted?(username : String) : Bool
+    blacklist_entry = @blacklist.find do |blacklist_entry|
+      blacklist_entry.username == username && blacklist_entry.mode.username?
+    end
+    !blacklist_entry.nil?
+  end
+
+  def ip_blacklisted?(username : String) : Bool
+    blacklist_entry = @blacklist.find do |blacklist_entry|
+      blacklist_entry.username == username && blacklist_entry.mode.address?
+    end
+    !blacklist_entry.nil?
+  end
+
+  def ban_client(username : String, reason = "") : Nil
     self.client_by_username(username) do |client|
-      cause = "Banned by operator"
+      @blacklist << BlacklistEntry.new(username, client.connection.remote_address.address, BlacklistMode::Username, reason)
+      cause = "Banned by operator for: #{reason}"
       Log.info &.emit "Disconnected client", username: client.username, cause: cause
       client.connection.send(ServerDisconnectPacket.new(cause))
       client.connection.close
       @clients.delete(client)
-      @blacklist << username
     end
+  end
+
+  def unban_client(username : String) : Nil
+    blacklist_entry = @blacklist.find do |blacklist_entry|
+      blacklist_entry.username == username && blacklist_entry.mode.username?
+    end
+    @blacklist.delete(blacklist_entry) if blacklist_entry
+  end
+
+  def ban_ip(username : String, reason = "") : Nil
+    self.client_by_username(username) do |client|
+      @blacklist << BlacklistEntry.new(username, client.connection.remote_address.address, BlacklistMode::Address, reason)
+      cause = "Banned by operator for: #{reason}"
+      Log.info &.emit "Disconnected client", username: client.username, cause: cause
+      client.connection.send(ServerDisconnectPacket.new(cause))
+      client.connection.close
+      @clients.delete(client)
+    end
+  end
+
+  def unban_ip(username : String) : Nil
+    blacklist_entry = @blacklist.find do |blacklist_entry|
+      blacklist_entry.username == username && blacklist_entry.mode.address?
+    end
+    @blacklist.delete(blacklist_entry) if blacklist_entry
   end
 
   def private_message(recipient : String, message : String)
@@ -471,6 +690,7 @@ class Woozy::Server
 
   def start : Nil
     Woozy.set_terminal_mode
+
     Log.info { "Server started" }
     self.update_console_input
 
@@ -493,7 +713,7 @@ class Woozy::Server
       select # Non-blocking, raising receive
       when fresh_client = @client_channel.receive
         @fresh_clients << fresh_client
-        spawn self.fresh_client_fiber(fresh_client)
+        spawn self.handle_fresh_client(fresh_client)
       else
         break # All clients received
       end
@@ -502,8 +722,14 @@ class Woozy::Server
     # Check for clients which have authenticated themselves
     @fresh_clients.reject! do |fresh_client|
       select # Non-blocking, raising receive
-      when packet = fresh_client.packet_channel.receive
-        self.handle_fresh_client(fresh_client, packet)
+      when authenticated = fresh_client.auth_channel.receive
+        if client = authenticated
+          Log.info &.emit "Client joined", address: client.connection.remote_address.to_s, username: client.username
+          @clients << client
+          spawn self.handle_client(client)
+          client.connection.send(ServerHandshakePacket.new)
+        end
+
         true
       else
         false
@@ -544,46 +770,32 @@ class Woozy::Server
       client.connection.close
     end
 
-    File.write("blacklist.txt", @blacklist.join('\n'))
-    File.write("whitelist.txt", @whitelist.join('\n'))
-
-    config = String.build do |string|
-      @config.each do |(key, value)|
-        string << key
-        string << '='
-        string << value
-        string << '\n'
+    blacklist = String.build do |string|
+      @blacklist.each_with_index do |blacklist_entry, index|
+        string << blacklist_entry.username
+        string << ','
+        string << blacklist_entry.address
+        string << ','
+        string << blacklist_entry.mode.to_s.downcase
+        string << ','
+        string << blacklist_entry.reason
+        string << '\n' if index != @blacklist.size - 1
       end
     end
 
-    File.write("config.txt", config)
+    File.write("blacklist.csv", blacklist)
+    File.write("whitelist.csv", @whitelist.join('\n'))
+
+    config = String.build do |string|
+      @config.each_with_index do |(key, value), index|
+        string << key
+        string << '='
+        string << value
+        string << '\n' if index != @config.keys.size - 1
+      end
+    end
+    File.write("server.cfg", config)
 
     exit
-  end
-end
-
-raise "Mismatched number of arguments" if ARGV.size.odd?
-
-host = "localhost"
-port = 1234
-
-index = 0
-while index < ARGV.size
-  case ARGV[index]
-  when "-h", "--host"
-    host = ARGV[index + 1]
-  when "-p", "--port"
-    port = ARGV[index + 1].to_i
-  end
-  index += 2
-end
-
-begin
-  server = Woozy::Server.new(host, port)
-  server.start
-rescue ex
-  Log.fatal(exception: ex) { "" }
-  if server
-    server.stop
   end
 end
