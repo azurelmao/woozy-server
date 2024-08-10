@@ -281,8 +281,8 @@ class Woozy::Server
       return
     end
 
-    if self.blacklisted?(username) || self.ip_blacklisted?(fresh_client.connection.remote_address.address)
-      cause = "Client is blacklisted"
+    if blacklist_entry = self.blacklisted?(username) || self.ip_blacklisted?(fresh_client.connection.remote_address.address)
+      cause = "Client is blacklisted for `#{blacklist_entry.reason}`"
       Log.info &.emit "Disconnected client", address: remote_address, username: username, cause: cause
       fresh_client.connection.send(ServerDisconnectPacket.new(cause))
       fresh_client.connection.close
@@ -711,7 +711,7 @@ class Woozy::Server
 
   def kick_client(username : String, reason = "") : Nil
     self.client_by_username(username) do |client|
-      cause = "Kicked by operator for: #{reason}"
+      cause = "Kicked by operator for `#{reason}`"
       Log.info &.emit "Disconnected client", username: client.username, cause: cause
       client.connection.send(ServerDisconnectPacket.new(cause))
       client.connection.close
@@ -719,24 +719,24 @@ class Woozy::Server
     end
   end
 
-  def blacklisted?(username : String) : Bool
+  def blacklisted?(username : String) : BlacklistEntry?
     blacklist_entry = @blacklist.find do |blacklist_entry|
       blacklist_entry.username == username && blacklist_entry.mode.username?
     end
-    !blacklist_entry.nil?
+    blacklist_entry
   end
 
-  def ip_blacklisted?(username : String) : Bool
+  def ip_blacklisted?(username : String) : BlacklistEntry?
     blacklist_entry = @blacklist.find do |blacklist_entry|
       blacklist_entry.username == username && blacklist_entry.mode.address?
     end
-    !blacklist_entry.nil?
+    blacklist_entry
   end
 
   def ban_client(username : String, reason = "") : Nil
     self.client_by_username(username) do |client|
       @blacklist << BlacklistEntry.new(username, client.connection.remote_address.address, BlacklistMode::Username, reason)
-      cause = "Banned by operator for: #{reason}"
+      cause = "Banned by operator for `#{reason}`"
       Log.info &.emit "Disconnected client", username: client.username, cause: cause
       client.connection.send(ServerDisconnectPacket.new(cause))
       client.connection.close
@@ -754,7 +754,7 @@ class Woozy::Server
   def ban_ip(username : String, reason = "") : Nil
     self.client_by_username(username) do |client|
       @blacklist << BlacklistEntry.new(username, client.connection.remote_address.address, BlacklistMode::Address, reason)
-      cause = "Banned by operator for: #{reason}"
+      cause = "Banned by operator for `#{reason}`"
       Log.info &.emit "Disconnected client", username: client.username, cause: cause
       client.connection.send(ServerDisconnectPacket.new(cause))
       client.connection.close
