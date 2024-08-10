@@ -77,11 +77,13 @@ class Woozy::Server
     end
 
     @blacklist = Set(BlacklistEntry).new
+    @invalid_blacklist = Set(String).new
     File.read("blacklist.csv").each_line do |line|
       data = line.strip.split(',')
 
       if data.size != 4
         Log.error { "Incorrect number of values in blacklist.csv, ignoring entry `#{line}`" }
+        @invalid_blacklist << line
         next
       end
 
@@ -90,12 +92,14 @@ class Woozy::Server
       username = username.strip
       unless Woozy.valid_username?(username)
         Log.error { "Invalid username in blacklist.csv, ignoring entry `#{line}`" }
+        @invalid_blacklist << line
         next
       end
 
       address = address.strip
       unless Socket::IPAddress.valid?(address)
         Log.error { "Invalid address in blacklist.csv, ignoring entry `#{line}`" }
+        @invalid_blacklist << line
         next
       end
 
@@ -107,6 +111,7 @@ class Woozy::Server
         mode = BlacklistMode::Address
       else
         Log.error { "Invalid mode in blacklist.csv, ignoring entry `#{line}`" }
+        @invalid_blacklist << line
         next
       end
 
@@ -115,16 +120,18 @@ class Woozy::Server
       @blacklist << BlacklistEntry.new(username, address, mode, reason)
     end
 
-    unless File.exists?("whitelist.csv")
-      File.write("whitelist.csv", "")
+    unless File.exists?("whitelist.txt")
+      File.write("whitelist.txt", "")
     end
 
     @whitelist = Set(String).new
-    File.read("whitelist.csv").each_line do |line|
+    @invalid_whitelist = Set(String).new
+    File.read("whitelist.txt").each_line do |line|
       username = line.strip
 
       unless Woozy.valid_username?(username)
-        Log.error { "Invalid username in whitelist.csv, ignoring entry `#{line}`" }
+        Log.error { "Invalid username in whitelist.txt, ignoring entry `#{line}`" }
+        @invalid_whitelist << line
         next
       end
 
@@ -146,8 +153,18 @@ class Woozy::Server
       File.write("server.cfg", config)
     end
 
+    @invalid_config = Set(String).new
     File.read("server.cfg").each_line do |line|
-      key, value = line.strip.split('=')
+      data = line.strip.split('=')
+
+      if data.size != 2
+        Log.error { "Incorrect format of config entry in server.cfg, ignoring entry `#{line}`" }
+        @invalid_config << line
+        next
+      end
+
+      key, value = data
+
       key = key.strip
       value = value.strip
 
@@ -156,14 +173,20 @@ class Woozy::Server
         if !parsed_value.nil? && parsed_value.class == @config[key].class
           @config[key] = parsed_value
         else
-          Log.error { "Invalid value `#{value}` for config key `#{key}` in server.cfg" }
+          Log.error { "Invalid value `#{value}` for config key `#{key}` in server.cfg, ignoring entry `#{line}`" }
+          @invalid_config << line
+          next
         end
       else
-        Log.error { "Unknown config key `#{key}` in server.cfg" }
+        Log.error { "Unknown config key `#{key}` in server.cfg, ignoring entry `#{line}`" }
+        @invalid_config << line
+        next
       end
     end
 
-    @char_channel = Channel(Chars).new
+    @char_channel = Channel(Slice(Char)).new
+    @console_history = Array(String).new
+    @console_history_index = 0
     @console_input = Array(Char).new
     @console_cursor = 0
 
@@ -184,11 +207,11 @@ class Woozy::Server
     bytes = Bytes.new(Packet::MaxSize)
 
     remote_address = if fresh_client.connection.closed?
-      fresh_client.auth_channel.send(nil)
-      return
-    else
-      fresh_client.connection.remote_address.to_s
-    end
+                       fresh_client.auth_channel.send(nil)
+                       return
+                     else
+                       fresh_client.connection.remote_address.to_s
+                     end
 
     bytes_read = 0
     begin
@@ -351,8 +374,6 @@ class Woozy::Server
     end
   end
 
-  alias Chars = StaticArray(Char, 4)
-
   enum KeyboardAction
     Stop
     Enter
@@ -362,25 +383,26 @@ class Woozy::Server
     Down
     Right
     Left
+    CtrlRight
+    CtrlLeft
   end
 
   def char_fiber : Nil
-    bytes = Bytes.new(4)
+    bytes = Bytes.new(6)
     loop do
       bytes_read = STDIN.read(bytes)
 
-      chars = Chars.new('\0')
+      chars = Slice(Char).new(bytes_read, '\0')
       bytes_read.times do |i|
         chars[i] = bytes[i].chr
-        bytes[i] = 0u8
       end
 
       spawn @char_channel.send(chars)
     end
   end
 
-  def handle_chars(chars : Chars) : KeyboardAction | Chars?
-    case char0 = chars[0]
+  def handle_chars(chars : Slice(Char)) : KeyboardAction | Slice(Char)
+    case char1 = chars[0]
     when '\u{3}', '\u{4}'
       return KeyboardAction::Stop
     when '\n' # Enter
@@ -388,9 +410,9 @@ class Woozy::Server
     when '\u{7f}' # Backspace
       return KeyboardAction::Backspace
     when '\e'
-      case char1 = chars[1]
+      case char2 = chars[1]
       when '['
-        case char2 = chars[2]
+        case char3 = chars[2]
         when 'A' # Up
           return KeyboardAction::Up
         when 'B' # Down
@@ -400,28 +422,42 @@ class Woozy::Server
         when 'D' # Left
           return KeyboardAction::Left
         when '3'
-          case char3 = chars[3]
+          case char4 = chars[3]
           when '~' # Delete
             return KeyboardAction::Delete
+          end
+        when '1'
+          case char4 = chars[3]
+          when ';'
+            case char5 = chars[4]
+            when '5'
+              case char6 = chars[5]
+              when 'C' # Ctrl + Right
+                return KeyboardAction::CtrlRight
+              when 'D' # Ctrl + Left
+                return KeyboardAction::CtrlLeft
+              end
+            end
           end
         end
       end
 
-      return nil
+      return Slice(Char).empty
     else
       return chars
     end
   end
 
+  # Clears current line, then returns text cursor to origin
   def clear_console_input : Nil
-    print "\e[2K\r" # Clears current line, then returns text cursor to origin
+    print "\e[2K\r"
   end
 
   def update_console_input : Nil
     print "> #{@console_input.join}\r\e[#{2 + @console_cursor}C"
   end
 
-  def handle_keyboard_action(keyboard_action : KeyboardAction | Chars) : String?
+  def handle_keyboard_action(keyboard_action : KeyboardAction | Slice(Char), & : Array(String) ->) : Nil
     case keyboard_action
     when KeyboardAction::Stop
       self.stop
@@ -429,7 +465,12 @@ class Woozy::Server
       command = @console_input.join
       @console_input.clear
       @console_cursor = 0
-      return command
+
+      if !command.blank? && !command.empty?
+        @console_history << command
+        @console_history_index = @console_history.size
+        yield command.split(' ')
+      end
     when KeyboardAction::Backspace
       if (index = @console_cursor - 1) >= 0
         @console_input.delete_at(index)
@@ -440,22 +481,90 @@ class Woozy::Server
         @console_input.delete_at(index)
       end
     when KeyboardAction::Up
+      unless @console_history.empty?
+        @console_history_index = Math.max(0, @console_history_index - 1)
+        @console_input = @console_history[@console_history_index].chars
+        @console_cursor = Math.min(@console_cursor, @console_input.size)
+      end
     when KeyboardAction::Down
+      unless @console_history.empty?
+        if @console_history_index + 1 < @console_history.size
+          @console_history_index = Math.min(@console_history.size - 1, @console_history_index + 1)
+          @console_input = @console_history[@console_history_index].chars
+          @console_cursor = Math.min(@console_cursor, @console_input.size)
+        else
+          @console_history_index = @console_history.size
+          @console_input.clear
+          @console_cursor = 0
+        end
+      end
     when KeyboardAction::Right
       @console_cursor = Math.min(@console_input.size, @console_cursor + 1)
     when KeyboardAction::Left
       @console_cursor = Math.max(0, @console_cursor - 1)
-    else
-      chars = keyboard_action.as Chars
-      chars.each do |char|
-        if char != '\0'
-          @console_input.insert(@console_cursor, char)
-          @console_cursor = Math.min(@console_input.size, @console_cursor + 1)
+    when KeyboardAction::CtrlRight
+      iter = @console_input[@console_cursor..].each
+
+      first_char = iter.next
+      if first_char.is_a? Iterator::Stop
+        return
+      end
+
+      index = @console_cursor + 1
+
+      case first_char
+      when .whitespace?
+        while (char = iter.next) && !char.is_a? Iterator::Stop
+          unless char.whitespace?
+            break
+          end
+          index += 1
+        end
+      else
+        while (char = iter.next) && !char.is_a? Iterator::Stop
+          if char.whitespace?
+            break
+          end
+          index += 1
         end
       end
-    end
 
-    nil
+      @console_cursor = index
+    when KeyboardAction::CtrlLeft
+      iter = @console_input[0...@console_cursor].reverse_each
+
+      first_char = iter.next
+      if first_char.is_a? Iterator::Stop
+        return
+      end
+
+      index = @console_cursor - 1
+
+      case first_char
+      when .whitespace?
+        while (char = iter.next) && !char.is_a? Iterator::Stop
+          unless char.whitespace?
+            break
+          end
+          index -= 1
+        end
+      else
+        while (char = iter.next) && !char.is_a? Iterator::Stop
+          if char.whitespace?
+            break
+          end
+          index -= 1
+        end
+      end
+
+      @console_cursor = index
+    else
+      chars = keyboard_action.as Slice(Char)
+      chars.each do |char|
+        @console_input.insert(@console_cursor, char)
+        @console_cursor = Math.min(@console_input.size, @console_cursor + 1)
+      end
+    end
   end
 
   def handle_command(command : Array(String)) : Nil
@@ -482,10 +591,10 @@ class Woozy::Server
       end
 
       reason = if command[2]?
-        command[2..].join(' ')
-      else
-        ""
-      end
+                 command[2..].join(' ')
+               else
+                 ""
+               end
 
       self.ban_client(username, reason)
     when "unban"
@@ -502,10 +611,10 @@ class Woozy::Server
       end
 
       reason = if command[2]?
-        command[2..].join(' ')
-      else
-        ""
-      end
+                 command[2..].join(' ')
+               else
+                 ""
+               end
 
       self.ban_ip(username, reason)
     when "unban-ip"
@@ -752,8 +861,9 @@ class Woozy::Server
     select
     when chars = @char_channel.receive
       if keyboard_action = self.handle_chars(chars)
-        command = self.handle_keyboard_action(keyboard_action)
-        self.handle_command(command.split(' ')) if command && !command.blank? && !command.empty?
+        self.handle_keyboard_action(keyboard_action) do |command|
+          self.handle_command(command)
+        end
       end
     else
     end
@@ -771,7 +881,7 @@ class Woozy::Server
     end
 
     blacklist = String.build do |string|
-      @blacklist.each_with_index do |blacklist_entry, index|
+      @blacklist.each do |blacklist_entry|
         string << blacklist_entry.username
         string << ','
         string << blacklist_entry.address
@@ -779,19 +889,37 @@ class Woozy::Server
         string << blacklist_entry.mode.to_s.downcase
         string << ','
         string << blacklist_entry.reason
-        string << '\n' if index != @blacklist.size - 1
+        string << '\n'
+      end
+      @invalid_blacklist.each do |invalid_entry|
+        string << invalid_entry
+        string << '\n'
       end
     end
-
     File.write("blacklist.csv", blacklist)
-    File.write("whitelist.csv", @whitelist.join('\n'))
+
+    whitelist = String.build do |string|
+      @whitelist.each do |username|
+        string << username
+        string << '\n'
+      end
+      @invalid_whitelist.each do |invalid_entry|
+        string << invalid_entry
+        string << '\n'
+      end
+    end
+    File.write("whitelist.txt", whitelist)
 
     config = String.build do |string|
-      @config.each_with_index do |(key, value), index|
+      @config.each do |(key, value)|
         string << key
         string << '='
         string << value
-        string << '\n' if index != @config.keys.size - 1
+        string << '\n'
+      end
+      @invalid_config.each do |invalid_entry|
+        string << invalid_entry
+        string << '\n'
       end
     end
     File.write("server.cfg", config)
