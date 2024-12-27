@@ -1,4 +1,14 @@
-require "./woozy/server"
+require "./server_actor"
+
+module Crystal
+  def self.main_user_code(argc : Int32, argv : UInt8**)
+    begin
+      previous_def
+    rescue ex
+      Log.fatal(exception: ex) { "" }
+    end
+  end
+end
 
 begin
   raise "Mismatched number of arguments" if ARGV.size.odd?
@@ -17,7 +27,7 @@ begin
     index += 2
   end
 
-  server = Woozy::Server.new(host, port)
+  server = Woozy::ServerActor.new(host, port)
   server.start
 rescue ex
   Log.fatal(exception: ex) { "" }

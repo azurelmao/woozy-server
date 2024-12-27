@@ -1,4 +1,4 @@
-require "./chunk"
+require "woozy/chunk"
 
 struct Woozy::World
   @chunks = Hash(ChunkPos, Chunk).new

@@ -6,12 +6,11 @@ authors:
 
 targets:
   woozy_server:
-    main: src/server.cr
+    main: src/server_actor.cr
 
 dependencies:
   woozy:
-    github: "azurelmao/woozy"
-    # path: "../woozy"
+    path: "../woozy"
     version: 0.1.0
   sqlite3:
     github: "crystal-lang/crystal-sqlite3"
