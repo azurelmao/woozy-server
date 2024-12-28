@@ -49,8 +49,6 @@ class Woozy::FreshClientReceiverActor
           socket.close
           return
         end
-
-        Log.trace{id}
       end
     rescue ex : OpenSSL::SSL::Error
       cause = "Client does not trust unverified CA"
@@ -60,7 +58,6 @@ class Woozy::FreshClientReceiverActor
       return
     end
 
-    Log.trace{id}
     packet = Packet.from_id(id, bytes)
 
     unless packet

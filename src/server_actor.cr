@@ -443,16 +443,8 @@ class Woozy::ServerActor
       @client_actors.delete(client)
     when ClientPrivateMessagePacket
       sender = client.username
-
-      unless recipient = packet.recipient
-        Log.error { "Missing recipient field in private message packet" }
-        return
-      end
-
-      unless message = packet.message
-        Log.error { "Missing message field in private message packet" }
-        return
-      end
+      recipient = packet.recipient
+      message = packet.message
 
       if recipient_client = self.get_client(recipient)
         Log.for("#{sender} > #{recipient}").info { message }
@@ -463,11 +455,7 @@ class Woozy::ServerActor
       end
     when ClientBroadcastMessagePacket
       sender = client.username
-
-      unless message = packet.message
-        Log.error { "Missing message field in broadcast message packet" }
-        return
-      end
+      message = packet.message
 
       Log.for(sender).info { message }
       @client_actors.each do |other_client|
@@ -487,8 +475,6 @@ class Woozy::ServerActor
 
     @chunks.each_value do |chunk|
       x, y, z = chunk.position.splat
-
-      Log.trace{chunk.position}
 
       block_palette = Hash(UInt16, String).new
       chunk.block_palette.to_a do |key, block|
